@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "cash": 100.0,
+  "positions": {},
+  "last_candle": {
+    "BTCUSDT": "1791806400000",
+    "ETHUSDT": "1791806400000"
+  },
+  "trades": [],
+  "utc_day": "2026-10-12",
+  "day_start_equity": 100.0
+}
