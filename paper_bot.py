@@ -25,6 +25,7 @@ TOP_SYMBOLS_LIMIT = 100
 EXCLUDED_BASE_ASSETS = {
     "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP",
     "USDE", "PYUSD", "USTC", "EUR", "EURC",
+    "USDS", "USD1", "USDD", "FRAX", "UST",
 }
 LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
@@ -154,9 +155,12 @@ def get_klines(symbol, interval, limit=260):
             return [
                 {
                     "time": int(row[0]),
+                    "open": float(row[1]),
                     "high": float(row[2]),
                     "low": float(row[3]),
                     "close": float(row[4]),
+                    "quote_volume": float(row[7]),
+                    "taker_buy_quote_volume": float(row[10]),
                 }
                 for row in rows
             ]
@@ -179,11 +183,26 @@ def get_klines(symbol, interval, limit=260):
 
 
 def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
-    """اختيار أعلى أزواج USDT حسب حجم التداول خلال 24 ساعة."""
+    """اختيار أعلى أزواج USDT النشطة حسب حجم تداول 24 ساعة."""
     errors = []
 
     for base_url in BASE_URLS:
         try:
+            info_response = session.get(
+                f"{base_url}/api/v3/exchangeInfo",
+                timeout=20,
+            )
+            info_response.raise_for_status()
+            exchange_info = info_response.json()
+
+            spot_symbols = {
+                item["symbol"]
+                for item in exchange_info.get("symbols", [])
+                if item.get("status") == "TRADING"
+                and item.get("quoteAsset") == "USDT"
+                and item.get("isSpotTradingAllowed", True)
+            }
+
             response = session.get(
                 f"{base_url}/api/v3/ticker/24hr",
                 timeout=20,
@@ -199,13 +218,14 @@ def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
             for item in tickers:
                 symbol = str(item.get("symbol", ""))
 
-                # أزواج التداول مقابل USDT فقط.
+                if symbol not in spot_symbols:
+                    continue
+
                 if not symbol.endswith("USDT") or len(symbol) <= 4:
                     continue
 
                 base_asset = symbol[:-4]
 
-                # استبعاد العملات المستقرة ورموز الرافعة الشائعة.
                 if base_asset in EXCLUDED_BASE_ASSETS:
                     continue
 
@@ -253,6 +273,7 @@ def new_state():
         "cash": START_BALANCE,
         "positions": {},
         "last_candle": {},
+        "last_liquidity_alert": {},
         "trades": [],
         "utc_day": datetime.now(timezone.utc).date().isoformat(),
         "day_start_equity": START_BALANCE,
@@ -280,6 +301,7 @@ def load_state():
         for key, default in (
             ("positions", {}),
             ("last_candle", {}),
+            ("last_liquidity_alert", {}),
             ("trades", []),
         ):
             state.setdefault(key, default)
@@ -442,6 +464,45 @@ def market_signal(symbol):
         and ema20[i] < ema50[i]
     )
 
+    # الهبوط خلال آخر ساعة وآخر أربع ساعات.
+    drop_1h_pct = (
+        (hourly[-1]["close"] / hourly[-2]["close"]) - 1
+    ) * 100
+
+    drop_4h_pct = (
+        (hourly[-1]["close"] / hourly[-5]["close"]) - 1
+    ) * 100
+
+    # مقارنة حجم الشمعة الأخيرة بمتوسط آخر 20 شمعة قبلها.
+    previous_volumes = [
+        candle["quote_volume"] for candle in hourly[-21:-1]
+    ]
+
+    average_volume = (
+        sum(previous_volumes) / len(previous_volumes)
+        if previous_volumes else 0
+    )
+
+    volume_multiple = (
+        hourly[-1]["quote_volume"] / average_volume
+        if average_volume > 0 else 0
+    )
+
+    taker_buy_ratio = (
+        hourly[-1]["taker_buy_quote_volume"]
+        / hourly[-1]["quote_volume"]
+        if hourly[-1]["quote_volume"] > 0 else 0
+    )
+
+    # تنبيه محتمل: هبوط ملحوظ + حجم مرتفع + شمعة صاعدة
+    # + نسبة شراء سوقية أعلى من 52%.
+    liquidity_inflow = (
+        (drop_1h_pct <= -2 or drop_4h_pct <= -3)
+        and volume_multiple >= 1.5
+        and hourly[-1]["close"] > hourly[-1]["open"]
+        and taker_buy_ratio >= 0.52
+    )
+
     return {
         "candle": hourly[-1],
         "atr": atr_value,
@@ -451,6 +512,11 @@ def market_signal(symbol):
             and 50 <= rsi_value <= 70
         ),
         "exit": crossed_down,
+        "drop_1h_pct": drop_1h_pct,
+        "drop_4h_pct": drop_4h_pct,
+        "volume_multiple": volume_multiple,
+        "taker_buy_ratio": taker_buy_ratio,
+        "liquidity_inflow": liquidity_inflow,
     }
 
 
@@ -477,7 +543,6 @@ def send_telegram(message):
 
 
 def run():
-    # الرسالة الأولى: بدأ البرنامج التشغيل.
     try:
         send_telegram("🚀 البوت بدأ التشغيل.")
         logging.info("تم إرسال إشعار بدء التشغيل.")
@@ -488,13 +553,12 @@ def run():
 
     state = load_state()
 
-    # اختيار أعلى 100 زوج USDT، مع إبقاء العملات ذات الصفقات المفتوحة.
+    # أعلى 100 زوج USDT، مع إبقاء العملات ذات الصفقات المفتوحة.
     top_symbols = get_top_symbols(TOP_SYMBOLS_LIMIT)
     symbols = list(dict.fromkeys(
         top_symbols + list(state["positions"].keys())
     ))
 
-    # تخطي العملة التي تفشل بياناتها بدل إيقاف الفحص كله.
     signals = {}
 
     for symbol in symbols:
@@ -515,7 +579,6 @@ def run():
             f"🔎 بيانات صالحة لهذا الفحص: {len(signals)}\n"
             "🤖 تداول وهمي فقط — لا توجد أوامر حقيقية."
         )
-        logging.info("تم إرسال إشعار نجاح فحص السوق.")
     except Exception:
         logging.exception(
             "تعذّر إرسال إشعار نجاح فحص السوق إلى تيليغرام."
@@ -551,14 +614,32 @@ def run():
         candle = signal["candle"]
         candle_key = str(candle["time"])
 
-        # عدم تكرار القرار على الشمعة نفسها.
+        # تنبيه سيولة مرة واحدة لكل شمعة ساعة.
+        if (
+            signal["liquidity_inflow"]
+            and state["last_liquidity_alert"].get(symbol) != candle_key
+        ):
+            messages.append(
+                f"💧 احتمال دخول سيولة شرائية: {symbol}\n"
+                f"تغير آخر ساعة: {signal['drop_1h_pct']:.2f}%\n"
+                f"تغير آخر 4 ساعات: {signal['drop_4h_pct']:.2f}%\n"
+                f"حجم التداول: {signal['volume_multiple']:.2f}x من المتوسط\n"
+                f"شراء السوق (Taker Buy): "
+                f"{signal['taker_buy_ratio'] * 100:.1f}%\n"
+                f"السعر الحالي: {candle['close']:.8f} USDT\n"
+                "⚠️ تنبيه مراقبة فقط، وليس توصية شراء مؤكدة."
+            )
+
+            state["last_liquidity_alert"][symbol] = candle_key
+
+        # عدم تكرار التداول على الشمعة نفسها.
         if state["last_candle"].get(symbol) == candle_key:
             continue
 
         position = state["positions"].get(symbol)
 
         if position:
-            # إذا لمس الوقف والهدف في الشمعة نفسها، افترض الوقف أولًا.
+            # إذا لمس الوقف والهدف في الشمعة نفسها، نحتسب الوقف أولًا.
             if candle["low"] <= position["stop"]:
                 messages.append(
                     sell(
@@ -611,7 +692,6 @@ def run():
     save_state(state)
     logging.info("%s", summary.replace("\n", " | "))
 
-    # إشعار تيليغرام عند وجود صفقات فقط.
     if messages:
         try:
             send_telegram("\n\n".join(messages + [summary]))
