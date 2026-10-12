@@ -1,3 +1,4 @@
+
 """بوت تداول وهمي فقط — لا ينفذ أي أوامر شراء أو بيع حقيقية."""
 
 import json
@@ -400,24 +401,36 @@ def send_telegram(message):
 
 
 def run():
-    # إشعار بسيط عند بدء تشغيل البوت.
+    # الرسالة الأولى: بدأ البرنامج التشغيل.
     try:
-        send_telegram("✅ البوت شغّال وبدأ التشغيل.")
-        logging.info("تم إرسال إشعار بدء التشغيل إلى تيليغرام.")
+        send_telegram("🚀 البوت بدأ التشغيل.")
+        logging.info("تم إرسال إشعار بدء التشغيل.")
     except Exception:
-        # لا نوقف البوت إذا تعذّر إرسال إشعار تيليغرام.
         logging.exception(
             "تعذّر إرسال إشعار بدء التشغيل إلى تيليغرام."
         )
 
     state = load_state()
 
-    # اجلب كل البيانات أولًا قبل تعديل حالة المحفظة.
-    # إذا فشل مصدر البيانات، لا تُنفّذ قرارات تداول لهذه الدورة.
+    # جلب البيانات وحساب الإشارات قبل اتخاذ أي قرار.
     signals = {
         symbol: market_signal(symbol)
         for symbol in SYMBOLS
     }
+
+    # الرسالة الثانية: نجح جلب البيانات وحساب الإشارات.
+    try:
+        send_telegram(
+            "✅ فحص السوق اكتمل بنجاح!\n"
+            "📊 تم جلب البيانات وحساب الإشارات.\n"
+            "🪙 العملات: BTC وETH\n"
+            "🤖 الوضع: تداول وهمي فقط."
+        )
+        logging.info("تم إرسال إشعار نجاح فحص السوق.")
+    except Exception:
+        logging.exception(
+            "تعذّر إرسال إشعار نجاح فحص السوق إلى تيليغرام."
+        )
 
     prices = {
         symbol: signals[symbol]["candle"]["close"]
@@ -506,8 +519,14 @@ def run():
     save_state(state)
     logging.info("%s", summary.replace("\n", " | "))
 
+    # إرسال إشعارات الصفقات فقط عند وجود صفقات.
     if messages:
-        send_telegram("\n\n".join(messages + [summary]))
+        try:
+            send_telegram("\n\n".join(messages + [summary]))
+        except Exception:
+            logging.exception(
+                "تعذّر إرسال إشعار الصفقة إلى تيليغرام."
+            )
 
         for message in messages:
             logging.info("%s", message)
