@@ -4,7 +4,7 @@ name: Paper Trading Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7 * * * *"
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: write
