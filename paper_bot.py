@@ -19,7 +19,14 @@ BASE_URLS = (
 )
 
 STATE_FILE = Path("paper_state.json")
-SYMBOLS = ("BTCUSDT", "ETHUSDT")
+TOP_SYMBOLS_LIMIT = 100
+
+# استبعاد العملات المستقرة ورموز الرافعة الشائعة.
+EXCLUDED_BASE_ASSETS = {
+    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP",
+    "USDE", "PYUSD", "USTC", "EUR", "EURC",
+}
+LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
 START_BALANCE = 100.0
 FEE_RATE = 0.001
@@ -108,7 +115,7 @@ def atr(candles, period=14):
 
 
 def get_klines(symbol, interval, limit=260):
-    """جلب بيانات السوق مع تجربة مصادر بديلة عند فشل الاتصال."""
+    """جلب بيانات الشموع مع تجربة مصادر بديلة."""
     errors = []
 
     for base_url in BASE_URLS:
@@ -168,6 +175,75 @@ def get_klines(symbol, interval, limit=260):
     raise RuntimeError(
         f"تعذر جلب بيانات {symbol} ({interval}) من جميع المصادر. "
         + " | ".join(errors)
+    )
+
+
+def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
+    """اختيار أعلى أزواج USDT حسب حجم التداول خلال 24 ساعة."""
+    errors = []
+
+    for base_url in BASE_URLS:
+        try:
+            response = session.get(
+                f"{base_url}/api/v3/ticker/24hr",
+                timeout=20,
+            )
+            response.raise_for_status()
+            tickers = response.json()
+
+            if not isinstance(tickers, list):
+                raise RuntimeError("استجابة قائمة العملات غير متوقعة")
+
+            eligible = []
+
+            for item in tickers:
+                symbol = str(item.get("symbol", ""))
+
+                # أزواج التداول مقابل USDT فقط.
+                if not symbol.endswith("USDT") or len(symbol) <= 4:
+                    continue
+
+                base_asset = symbol[:-4]
+
+                # استبعاد العملات المستقرة ورموز الرافعة الشائعة.
+                if base_asset in EXCLUDED_BASE_ASSETS:
+                    continue
+
+                if base_asset.endswith(LEVERAGED_SUFFIXES):
+                    continue
+
+                try:
+                    quote_volume = float(item.get("quoteVolume", 0))
+                except (TypeError, ValueError):
+                    continue
+
+                if quote_volume > 0:
+                    eligible.append((symbol, quote_volume))
+
+            eligible.sort(key=lambda pair: pair[1], reverse=True)
+            symbols = [symbol for symbol, _ in eligible[:limit]]
+
+            if not symbols:
+                raise RuntimeError("لم يتم العثور على أزواج USDT مناسبة")
+
+            logging.info(
+                "تم اختيار %s زوجًا حسب حجم التداول خلال 24 ساعة.",
+                len(symbols),
+            )
+            return symbols
+
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+            RuntimeError,
+        ) as exc:
+            error = f"{base_url}: {exc}"
+            errors.append(error)
+            logging.warning("تعذر جلب قائمة العملات: %s", error)
+
+    raise RuntimeError(
+        "تعذر جلب قائمة العملات من جميع المصادر. " + " | ".join(errors)
     )
 
 
@@ -294,10 +370,10 @@ def buy(state, symbol, candle, atr_value, account_equity):
     )
 
     return (
-        f"🟢 PAPER BUY {symbol} @ {entry:.2f}\n"
+        f"🟢 PAPER BUY {symbol} @ {entry:.8f}\n"
         f"الكمية: {qty:.6f}\n"
-        f"وقف الخسارة: {stop:.2f}\n"
-        f"الهدف: {target:.2f}"
+        f"وقف الخسارة: {stop:.8f}\n"
+        f"الهدف: {target:.8f}"
     )
 
 
@@ -323,7 +399,7 @@ def sell(state, symbol, raw_price, reason):
     )
 
     return (
-        f"🔴 PAPER SELL {symbol} @ {price:.2f}\n"
+        f"🔴 PAPER SELL {symbol} @ {price:.8f}\n"
         f"النتيجة: {pnl:+.3f} USDT\n"
         f"السبب: {reason}"
     )
@@ -412,19 +488,32 @@ def run():
 
     state = load_state()
 
-    # جلب البيانات وحساب الإشارات قبل اتخاذ أي قرار.
-    signals = {
-        symbol: market_signal(symbol)
-        for symbol in SYMBOLS
-    }
+    # اختيار أعلى 100 زوج USDT، مع إبقاء العملات ذات الصفقات المفتوحة.
+    top_symbols = get_top_symbols(TOP_SYMBOLS_LIMIT)
+    symbols = list(dict.fromkeys(
+        top_symbols + list(state["positions"].keys())
+    ))
 
-    # الرسالة الثانية: نجح جلب البيانات وحساب الإشارات.
+    # تخطي العملة التي تفشل بياناتها بدل إيقاف الفحص كله.
+    signals = {}
+
+    for symbol in symbols:
+        try:
+            signals[symbol] = market_signal(symbol)
+        except Exception:
+            logging.exception(
+                "تخطي %s بسبب تعذر فحص بياناتها.", symbol
+            )
+
+    if not signals:
+        raise RuntimeError("فشل جلب بيانات جميع العملات المختارة.")
+
     try:
         send_telegram(
-            "✅ فحص السوق اكتمل بنجاح!\n"
-            "📊 تم جلب البيانات وحساب الإشارات.\n"
-            "🪙 العملات: BTC وETH\n"
-            "🤖 الوضع: تداول وهمي فقط."
+            "✅ فحص السوق اكتمل!\n"
+            f"📊 العملات المختارة: {len(top_symbols)} من أعلى أزواج USDT حجمًا.\n"
+            f"🔎 بيانات صالحة لهذا الفحص: {len(signals)}\n"
+            "🤖 تداول وهمي فقط — لا توجد أوامر حقيقية."
         )
         logging.info("تم إرسال إشعار نجاح فحص السوق.")
     except Exception:
@@ -433,8 +522,8 @@ def run():
         )
 
     prices = {
-        symbol: signals[symbol]["candle"]["close"]
-        for symbol in SYMBOLS
+        symbol: signal["candle"]["close"]
+        for symbol, signal in signals.items()
     }
 
     current_equity = equity(state, prices)
@@ -454,12 +543,15 @@ def run():
 
     messages = []
 
-    for symbol in SYMBOLS:
+    for symbol in symbols:
+        if symbol not in signals:
+            continue
+
         signal = signals[symbol]
         candle = signal["candle"]
         candle_key = str(candle["time"])
 
-        # لا تكرر القرار على الشمعة نفسها.
+        # عدم تكرار القرار على الشمعة نفسها.
         if state["last_candle"].get(symbol) == candle_key:
             continue
 
@@ -519,7 +611,7 @@ def run():
     save_state(state)
     logging.info("%s", summary.replace("\n", " | "))
 
-    # إرسال إشعارات الصفقات فقط عند وجود صفقات.
+    # إشعار تيليغرام عند وجود صفقات فقط.
     if messages:
         try:
             send_telegram("\n\n".join(messages + [summary]))
