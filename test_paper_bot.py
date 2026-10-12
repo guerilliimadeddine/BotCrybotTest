@@ -1,6 +1,7 @@
+
 import unittest
 
-from bot import atr, ema, equity, new_state, rsi
+from paper_bot import atr, ema, equity, new_state, rsi
 
 
 class PaperBotTests(unittest.TestCase):
@@ -24,10 +25,12 @@ class PaperBotTests(unittest.TestCase):
         state = new_state()
         state["cash"] = 80.0
         state["positions"]["BTCUSDT"] = {
-            "qty": 0.01, "entry": 2000.0
+            "qty": 0.01,
+            "entry": 2000.0,
         }
         self.assertAlmostEqual(
-            equity(state, {"BTCUSDT": 3000.0}), 110.0
+            equity(state, {"BTCUSDT": 3000.0}),
+            110.0,
         )
 
 
