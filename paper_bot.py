@@ -1,15 +1,17 @@
 
-"""بوت تداول وهمي فقط — لا ينفذ أي أوامر شراء أو بيع حقيقية."""
+"""بوت تداول وهمي على إطار 10 دقائق — لا ينفذ أوامر حقيقية."""
 
 import json
 import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-# ===== الإعدادات =====
+# ==================== الإعدادات ====================
+
 BASE_URLS = (
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -20,14 +22,7 @@ BASE_URLS = (
 
 STATE_FILE = Path("paper_state.json")
 TOP_SYMBOLS_LIMIT = 100
-
-# استبعاد العملات المستقرة ورموز الرافعة الشائعة.
-EXCLUDED_BASE_ASSETS = {
-    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP",
-    "USDE", "PYUSD", "USTC", "EUR", "EURC",
-    "USDS", "USD1", "USDD", "FRAX", "UST",
-}
-LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
+MAX_WORKERS = 10
 
 START_BALANCE = 100.0
 FEE_RATE = 0.001
@@ -40,26 +35,37 @@ REWARD_RISK = 2.0
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+EXCLUDED_BASE_ASSETS = {
+    "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP",
+    "USDE", "PYUSD", "USTC", "EUR", "EURC", "USDS",
+    "USD1", "USDD", "FRAX", "UST",
+}
+LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
 session = requests.Session()
-session.headers.update({"User-Agent": "crybtoimad-paper-bot/1.0"})
+session.headers.update({"User-Agent": "paper-trading-bot/2.0"})
 
+
+# ==================== المؤشرات الفنية ====================
 
 def ema(values, period):
-    if period < 1 or len(values) < period:
+    if len(values) < period:
         return []
 
     alpha = 2.0 / (period + 1)
-    result = [sum(values[:period]) / period]
+    current = sum(values[:period]) / period
+    result = [None] * (period - 1) + [current]
 
     for value in values[period:]:
-        result.append(alpha * value + (1 - alpha) * result[-1])
+        current = alpha * value + (1 - alpha) * current
+        result.append(current)
 
-    return [None] * (period - 1) + result
+    return result
 
 
 def rsi(values, period=14):
@@ -71,8 +77,8 @@ def rsi(values, period=14):
         for i in range(1, len(values))
     ]
 
-    gains = [max(x, 0.0) for x in changes]
-    losses = [max(-x, 0.0) for x in changes]
+    gains = [max(change, 0.0) for change in changes]
+    losses = [max(-change, 0.0) for change in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -98,13 +104,13 @@ def atr(candles, period=14):
     ranges = []
 
     for i in range(1, len(candles)):
-        candle = candles[i]
+        current = candles[i]
         previous_close = candles[i - 1]["close"]
 
         ranges.append(max(
-            candle["high"] - candle["low"],
-            abs(candle["high"] - previous_close),
-            abs(candle["low"] - previous_close),
+            current["high"] - current["low"],
+            abs(current["high"] - previous_close),
+            abs(current["low"] - previous_close),
         ))
 
     value = sum(ranges[:period]) / period
@@ -115,8 +121,9 @@ def atr(candles, period=14):
     return value
 
 
+# ==================== بيانات Binance ====================
+
 def get_klines(symbol, interval, limit=260):
-    """جلب بيانات الشموع مع تجربة مصادر بديلة."""
     errors = []
 
     for base_url in BASE_URLS:
@@ -128,20 +135,19 @@ def get_klines(symbol, interval, limit=260):
                     "interval": interval,
                     "limit": limit,
                 },
-                timeout=15,
+                timeout=12,
             )
-
             response.raise_for_status()
             rows = response.json()
 
             if not isinstance(rows, list):
-                raise RuntimeError("استجابة بيانات غير متوقعة")
+                raise RuntimeError("استجابة شموع غير صالحة")
 
             now_ms = int(
                 datetime.now(timezone.utc).timestamp() * 1000
             )
 
-            # تجاهل الشمعة التي لم تغلق بعد.
+            # استعمال الشموع المغلقة فقط.
             rows = [
                 row for row in rows
                 if int(row[6]) < now_ms
@@ -149,7 +155,7 @@ def get_klines(symbol, interval, limit=260):
 
             if len(rows) < 205:
                 raise RuntimeError(
-                    f"الشموع المغلقة غير كافية: {symbol} {interval}"
+                    f"شموع مغلقة غير كافية: {symbol} {interval}"
                 )
 
             return [
@@ -172,32 +178,28 @@ def get_klines(symbol, interval, limit=260):
             IndexError,
             RuntimeError,
         ) as exc:
-            error = f"{base_url}: {exc}"
-            errors.append(error)
-            logging.warning("فشل مصدر البيانات: %s", error)
+            errors.append(f"{base_url}: {exc}")
 
     raise RuntimeError(
-        f"تعذر جلب بيانات {symbol} ({interval}) من جميع المصادر. "
-        + " | ".join(errors)
+        f"فشل جلب {symbol} {interval}: " + " | ".join(errors)
     )
 
 
 def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
-    """اختيار أعلى أزواج USDT النشطة حسب حجم تداول 24 ساعة."""
     errors = []
 
     for base_url in BASE_URLS:
         try:
             info_response = session.get(
                 f"{base_url}/api/v3/exchangeInfo",
-                timeout=20,
+                timeout=15,
             )
             info_response.raise_for_status()
-            exchange_info = info_response.json()
+            info = info_response.json()
 
             spot_symbols = {
                 item["symbol"]
-                for item in exchange_info.get("symbols", [])
+                for item in info.get("symbols", [])
                 if item.get("status") == "TRADING"
                 and item.get("quoteAsset") == "USDT"
                 and item.get("isSpotTradingAllowed", True)
@@ -205,13 +207,10 @@ def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
 
             response = session.get(
                 f"{base_url}/api/v3/ticker/24hr",
-                timeout=20,
+                timeout=15,
             )
             response.raise_for_status()
             tickers = response.json()
-
-            if not isinstance(tickers, list):
-                raise RuntimeError("استجابة قائمة العملات غير متوقعة")
 
             eligible = []
 
@@ -221,7 +220,7 @@ def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
                 if symbol not in spot_symbols:
                     continue
 
-                if not symbol.endswith("USDT") or len(symbol) <= 4:
+                if not symbol.endswith("USDT"):
                     continue
 
                 base_asset = symbol[:-4]
@@ -233,23 +232,20 @@ def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
                     continue
 
                 try:
-                    quote_volume = float(item.get("quoteVolume", 0))
+                    volume = float(item.get("quoteVolume", 0))
                 except (TypeError, ValueError):
                     continue
 
-                if quote_volume > 0:
-                    eligible.append((symbol, quote_volume))
+                if volume > 0:
+                    eligible.append((symbol, volume))
 
             eligible.sort(key=lambda pair: pair[1], reverse=True)
             symbols = [symbol for symbol, _ in eligible[:limit]]
 
             if not symbols:
-                raise RuntimeError("لم يتم العثور على أزواج USDT مناسبة")
+                raise RuntimeError("لم يتم العثور على أزواج مناسبة")
 
-            logging.info(
-                "تم اختيار %s زوجًا حسب حجم التداول خلال 24 ساعة.",
-                len(symbols),
-            )
+            logging.info("تم اختيار %d زوج USDT.", len(symbols))
             return symbols
 
         except (
@@ -258,18 +254,18 @@ def get_top_symbols(limit=TOP_SYMBOLS_LIMIT):
             TypeError,
             RuntimeError,
         ) as exc:
-            error = f"{base_url}: {exc}"
-            errors.append(error)
-            logging.warning("تعذر جلب قائمة العملات: %s", error)
+            errors.append(f"{base_url}: {exc}")
 
     raise RuntimeError(
-        "تعذر جلب قائمة العملات من جميع المصادر. " + " | ".join(errors)
+        "فشل جلب قائمة العملات: " + " | ".join(errors)
     )
 
 
+# ==================== المحفظة الوهمية ====================
+
 def new_state():
     return {
-        "version": 1,
+        "version": 2,
         "cash": START_BALANCE,
         "positions": {},
         "last_candle": {},
@@ -285,43 +281,42 @@ def load_state():
         return new_state()
 
     try:
-        state = json.loads(
-            STATE_FILE.read_text(encoding="utf-8")
-        )
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
 
-        if not isinstance(state, dict) or state.get("version") != 1:
-            raise ValueError("إصدار ملف المحفظة غير مدعوم")
+        if not isinstance(state, dict):
+            raise ValueError("ملف المحفظة غير صالح")
 
-        if not isinstance(state.get("cash"), (int, float)):
-            raise ValueError("الرصيد النقدي غير صالح")
-
-        if state["cash"] < -1e-8:
-            raise ValueError("الرصيد النقدي سالب")
+        # الحفاظ على الصفقات المفتوحة من الإصدار السابق.
+        state["version"] = 2
 
         for key, default in (
+            ("cash", START_BALANCE),
             ("positions", {}),
             ("last_candle", {}),
             ("last_liquidity_alert", {}),
             ("trades", []),
+            ("utc_day", datetime.now(timezone.utc).date().isoformat()),
+            ("day_start_equity", START_BALANCE),
         ):
             state.setdefault(key, default)
 
+        if not isinstance(state["cash"], (int, float)):
+            raise ValueError("الرصيد النقدي غير صالح")
+
         return state
 
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
-            f"تعذّر قراءة {STATE_FILE} بأمان: {exc}"
+            f"تعذر قراءة المحفظة بأمان: {exc}"
         ) from exc
 
 
 def save_state(state):
     temp_file = STATE_FILE.with_suffix(".tmp")
-
     temp_file.write_text(
         json.dumps(state, indent=2),
         encoding="utf-8",
     )
-
     temp_file.replace(STATE_FILE)
 
 
@@ -346,11 +341,8 @@ def record_trade(
         "qty": round(qty, 8),
         "fee": round(fee, 8),
         "reason": reason,
-        "realized_pnl": (
-            None if pnl is None else round(pnl, 8)
-        ),
+        "realized_pnl": None if pnl is None else round(pnl, 8),
     })
-
     state["trades"] = state["trades"][-500:]
 
 
@@ -363,10 +355,7 @@ def buy(state, symbol, candle, atr_value, account_equity):
     if entry <= 0 or atr_value <= 0 or risk_per_unit <= 0:
         return None
 
-    qty_by_risk = (
-        account_equity * RISK_FRACTION / risk_per_unit
-    )
-
+    qty_by_risk = account_equity * RISK_FRACTION / risk_per_unit
     qty_by_cash = cash / (entry * (1 + FEE_RATE))
     qty = min(qty_by_risk, qty_by_cash)
 
@@ -388,11 +377,12 @@ def buy(state, symbol, candle, atr_value, account_equity):
     }
 
     record_trade(
-        state, symbol, "BUY", entry, qty, fee, "strategy_entry"
+        state, symbol, "BUY", entry, qty, fee, "10m_strategy_entry"
     )
 
     return (
-        f"🟢 PAPER BUY {symbol} @ {entry:.8f}\n"
+        f"🟢 PAPER BUY: {symbol}\n"
+        f"الدخول: {entry:.8f}\n"
         f"الكمية: {qty:.6f}\n"
         f"وقف الخسارة: {stop:.8f}\n"
         f"الهدف: {target:.8f}"
@@ -410,8 +400,7 @@ def sell(state, symbol, raw_price, reason):
     state["cash"] += proceeds - fee
 
     pnl = (
-        proceeds
-        - fee
+        proceeds - fee
         - qty * float(position["entry"])
         - float(position["entry_fee"])
     )
@@ -421,113 +410,115 @@ def sell(state, symbol, raw_price, reason):
     )
 
     return (
-        f"🔴 PAPER SELL {symbol} @ {price:.8f}\n"
+        f"🔴 PAPER SELL: {symbol}\n"
+        f"سعر الخروج: {price:.8f}\n"
         f"النتيجة: {pnl:+.3f} USDT\n"
         f"السبب: {reason}"
     )
 
 
-def market_signal(symbol):
-    hourly = get_klines(symbol, "1h")
-    four_hour = get_klines(symbol, "4h")
+# ==================== استراتيجية 10 دقائق ====================
 
-    closes = [candle["close"] for candle in hourly]
+def market_signal(symbol):
+    candles = get_klines(symbol, "10m")
+    trend_candles = get_klines(symbol, "30m")
+
+    closes = [c["close"] for c in candles]
+    trend_closes = [c["close"] for c in trend_candles]
 
     ema20 = ema(closes, 20)
     ema50 = ema(closes, 50)
-
-    ema200_4h = ema(
-        [candle["close"] for candle in four_hour], 200
-    )
-
-    i = len(closes) - 1
-    previous = i - 1
+    trend_ema200 = ema(trend_closes, 200)
 
     rsi_value = rsi(closes, 14)
-    atr_value = atr(hourly, 14)
+    atr_value = atr(candles, 14)
 
     if (
         rsi_value is None
         or atr_value is None
-        or not ema200_4h
-        or ema200_4h[-1] is None
+        or not trend_ema200
+        or trend_ema200[-1] is None
     ):
         raise RuntimeError(f"المؤشرات غير جاهزة: {symbol}")
 
-    crossed_up = (
-        ema20[previous] <= ema50[previous]
-        and ema20[i] > ema50[i]
-    )
+    last = candles[-1]
+    previous = candles[-2]
 
-    crossed_down = (
-        ema20[previous] >= ema50[previous]
-        and ema20[i] < ema50[i]
-    )
+    # الحركة من 6 شموع إلى 24 شمعة: ساعة وأربع ساعات تقريبًا.
+    drop_1h_pct = (last["close"] / candles[-7]["close"] - 1) * 100
+    drop_4h_pct = (last["close"] / candles[-25]["close"] - 1) * 100
 
-    # الهبوط خلال آخر ساعة وآخر أربع ساعات.
-    drop_1h_pct = (
-        (hourly[-1]["close"] / hourly[-2]["close"]) - 1
-    ) * 100
-
-    drop_4h_pct = (
-        (hourly[-1]["close"] / hourly[-5]["close"]) - 1
-    ) * 100
-
-    # مقارنة حجم الشمعة الأخيرة بمتوسط آخر 20 شمعة قبلها.
+    # متوسط حجم التداول لعشرين شمعة سابقة.
     previous_volumes = [
-        candle["quote_volume"] for candle in hourly[-21:-1]
+        c["quote_volume"] for c in candles[-21:-1]
     ]
-
-    average_volume = (
+    avg_volume = (
         sum(previous_volumes) / len(previous_volumes)
         if previous_volumes else 0
     )
 
     volume_multiple = (
-        hourly[-1]["quote_volume"] / average_volume
-        if average_volume > 0 else 0
+        last["quote_volume"] / avg_volume if avg_volume > 0 else 0
     )
 
     taker_buy_ratio = (
-        hourly[-1]["taker_buy_quote_volume"]
-        / hourly[-1]["quote_volume"]
-        if hourly[-1]["quote_volume"] > 0 else 0
+        last["taker_buy_quote_volume"] / last["quote_volume"]
+        if last["quote_volume"] > 0 else 0
     )
 
-    # تنبيه محتمل: هبوط ملحوظ + حجم مرتفع + شمعة صاعدة
-    # + نسبة شراء سوقية أعلى من 52%.
-    liquidity_inflow = (
-        (drop_1h_pct <= -2 or drop_4h_pct <= -3)
-        and volume_multiple >= 1.5
-        and hourly[-1]["close"] > hourly[-1]["open"]
-        and taker_buy_ratio >= 0.52
+    # شروط ارتداد بعد هبوط.
+    price_dropped = drop_1h_pct <= -2 or drop_4h_pct <= -3
+    bullish_candle = last["close"] > last["open"]
+    breaks_previous_high = last["close"] > previous["high"]
+    volume_surge = volume_multiple >= 1.5
+    buying_pressure = taker_buy_ratio >= 0.52
+
+    # تأكيد الاتجاه على إطار 30 دقيقة.
+    trend_ok = trend_closes[-1] > trend_ema200[-1]
+
+    buy_signal = (
+        price_dropped
+        and bullish_candle
+        and breaks_previous_high
+        and volume_surge
+        and buying_pressure
+        and trend_ok
+        and 40 <= rsi_value <= 68
+    )
+
+    exit_signal = (
+        ema20[-2] >= ema50[-2]
+        and ema20[-1] < ema50[-1]
+    )
+
+    liquidity_alert = (
+        price_dropped
+        and bullish_candle
+        and volume_surge
+        and buying_pressure
     )
 
     return {
-        "candle": hourly[-1],
+        "candle": last,
         "atr": atr_value,
-        "buy": (
-            crossed_up
-            and closes[-1] > ema200_4h[-1]
-            and 50 <= rsi_value <= 70
-        ),
-        "exit": crossed_down,
+        "buy": buy_signal,
+        "exit": exit_signal,
         "drop_1h_pct": drop_1h_pct,
         "drop_4h_pct": drop_4h_pct,
         "volume_multiple": volume_multiple,
         "taker_buy_ratio": taker_buy_ratio,
-        "liquidity_inflow": liquidity_inflow,
+        "liquidity_inflow": liquidity_alert,
     }
 
 
+# ==================== Telegram ====================
+
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.info(
-            "لم تُضبط أسرار تيليغرام؛ تم تخطي إرسال الرسالة."
-        )
+        logging.info("إعدادات Telegram غير موجودة؛ تم تخطي الرسالة.")
         return
 
-    response = session.post(
+    response = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
         json={
             "chat_id": TELEGRAM_CHAT_ID,
@@ -535,25 +526,25 @@ def send_telegram(message):
         },
         timeout=15,
     )
-
     response.raise_for_status()
 
     if not response.json().get("ok"):
-        raise RuntimeError("رفضت واجهة تيليغرام الرسالة")
+        raise RuntimeError("فشل إرسال رسالة Telegram")
 
+
+# ==================== تشغيل البوت ====================
 
 def run():
-    try:
-        send_telegram("🚀 البوت بدأ التشغيل.")
-        logging.info("تم إرسال إشعار بدء التشغيل.")
-    except Exception:
-        logging.exception(
-            "تعذّر إرسال إشعار بدء التشغيل إلى تيليغرام."
-        )
-
     state = load_state()
 
-    # أعلى 100 زوج USDT، مع إبقاء العملات ذات الصفقات المفتوحة.
+    try:
+        send_telegram(
+            "🚀 بدأ فحص بوت التداول الوهمي.\n"
+            "الاستراتيجية: 10 دقائق + تأكيد 30 دقيقة."
+        )
+    except Exception:
+        logging.exception("تعذر إرسال إشعار البدء.")
+
     top_symbols = get_top_symbols(TOP_SYMBOLS_LIMIT)
     symbols = list(dict.fromkeys(
         top_symbols + list(state["positions"].keys())
@@ -561,48 +552,34 @@ def run():
 
     signals = {}
 
-    for symbol in symbols:
-        try:
-            signals[symbol] = market_signal(symbol)
-        except Exception:
-            logging.exception(
-                "تخطي %s بسبب تعذر فحص بياناتها.", symbol
-            )
+    # الفحص المتوازي لتقليل زمن فحص العملات.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(market_signal, symbol): symbol
+            for symbol in symbols
+        }
+
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                signals[symbol] = future.result()
+            except Exception:
+                logging.exception("تعذر فحص %s", symbol)
 
     if not signals:
-        raise RuntimeError("فشل جلب بيانات جميع العملات المختارة.")
-
-    try:
-        send_telegram(
-            "✅ فحص السوق اكتمل!\n"
-            f"📊 العملات المختارة: {len(top_symbols)} من أعلى أزواج USDT حجمًا.\n"
-            f"🔎 بيانات صالحة لهذا الفحص: {len(signals)}\n"
-            "🤖 تداول وهمي فقط — لا توجد أوامر حقيقية."
-        )
-    except Exception:
-        logging.exception(
-            "تعذّر إرسال إشعار نجاح فحص السوق إلى تيليغرام."
-        )
+        raise RuntimeError("فشل فحص جميع العملات.")
 
     prices = {
-        symbol: signal["candle"]["close"]
-        for symbol, signal in signals.items()
+        symbol: data["candle"]["close"]
+        for symbol, data in signals.items()
     }
 
-    current_equity = equity(state, prices)
     today = datetime.now(timezone.utc).date().isoformat()
+    current_equity = equity(state, prices)
 
     if state.get("utc_day") != today:
         state["utc_day"] = today
         state["day_start_equity"] = current_equity
-
-    day_start = float(
-        state.get("day_start_equity", START_BALANCE)
-    )
-
-    loss_paused = (
-        current_equity <= day_start * (1 - DAILY_LOSS_LIMIT)
-    )
 
     messages = []
 
@@ -614,94 +591,93 @@ def run():
         candle = signal["candle"]
         candle_key = str(candle["time"])
 
-        # تنبيه سيولة مرة واحدة لكل شمعة ساعة.
+        # تنبيه السيولة مرة واحدة لكل شمعة 10 دقائق.
         if (
             signal["liquidity_inflow"]
             and state["last_liquidity_alert"].get(symbol) != candle_key
         ):
             messages.append(
-                f"💧 احتمال دخول سيولة شرائية: {symbol}\n"
-                f"تغير آخر ساعة: {signal['drop_1h_pct']:.2f}%\n"
-                f"تغير آخر 4 ساعات: {signal['drop_4h_pct']:.2f}%\n"
-                f"حجم التداول: {signal['volume_multiple']:.2f}x من المتوسط\n"
-                f"شراء السوق (Taker Buy): "
-                f"{signal['taker_buy_ratio'] * 100:.1f}%\n"
-                f"السعر الحالي: {candle['close']:.8f} USDT\n"
-                "⚠️ تنبيه مراقبة فقط، وليس توصية شراء مؤكدة."
+                f"💧 احتمال نشاط شرائي: {symbol}\n"
+                f"هبوط ساعة: {signal['drop_1h_pct']:.2f}%\n"
+                f"هبوط 4 ساعات: {signal['drop_4h_pct']:.2f}%\n"
+                f"حجم التداول: {signal['volume_multiple']:.2f}x\n"
+                f"شراء السوق: {signal['taker_buy_ratio'] * 100:.1f}%\n"
+                f"السعر: {candle['close']:.8f} USDT\n"
+                "⚠️ تنبيه مراقبة وليس ضمانًا للارتداد."
             )
-
             state["last_liquidity_alert"][symbol] = candle_key
 
-        # عدم تكرار التداول على الشمعة نفسها.
+        # لا تكرر القرارات على الشمعة نفسها.
         if state["last_candle"].get(symbol) == candle_key:
             continue
 
         position = state["positions"].get(symbol)
 
         if position:
-            # إذا لمس الوقف والهدف في الشمعة نفسها، نحتسب الوقف أولًا.
+            # إذا لمس الوقف والهدف داخل الشمعة نفسها، نحتسب الوقف أولًا.
             if candle["low"] <= position["stop"]:
                 messages.append(
-                    sell(
-                        state, symbol, position["stop"], "stop_loss"
-                    )
+                    sell(state, symbol, position["stop"], "stop_loss")
                 )
 
             elif candle["high"] >= position["target"]:
                 messages.append(
-                    sell(
-                        state, symbol, position["target"], "take_profit"
-                    )
+                    sell(state, symbol, position["target"], "take_profit")
                 )
 
             elif signal["exit"]:
                 messages.append(
-                    sell(
-                        state,
-                        symbol,
-                        candle["close"],
-                        "EMA_cross_down",
-                    )
+                    sell(state, symbol, candle["close"], "EMA_cross_down")
                 )
 
-        elif not loss_paused and signal["buy"]:
-            message = buy(
-                state,
-                symbol,
-                candle,
-                signal["atr"],
-                current_equity,
+        else:
+            # إعادة حساب حد الخسارة قبل كل دخول.
+            current_equity = equity(state, prices)
+            day_start = float(state.get("day_start_equity", START_BALANCE))
+            loss_paused = (
+                current_equity <= day_start * (1 - DAILY_LOSS_LIMIT)
             )
 
-            if message:
-                messages.append(message)
+            if not loss_paused and signal["buy"]:
+                message = buy(
+                    state,
+                    symbol,
+                    candle,
+                    signal["atr"],
+                    current_equity,
+                )
+                if message:
+                    messages.append(message)
 
         state["last_candle"][symbol] = candle_key
 
     current_equity = equity(state, prices)
+    day_start = float(state.get("day_start_equity", START_BALANCE))
+    loss_paused = (
+        current_equity <= day_start * (1 - DAILY_LOSS_LIMIT)
+    )
 
     summary = (
-        "📊 PAPER TRADING ONLY — تداول وهمي فقط\n"
+        "📊 ملخص التداول الوهمي\n"
         f"النقد: {state['cash']:.2f} USDT\n"
         f"قيمة المحفظة: {current_equity:.2f} USDT\n"
         f"الصفقات المفتوحة: {len(state['positions'])}\n"
-        f"إيقاف فتح صفقات جديدة بسبب حد الخسارة: "
-        f"{'نعم' if loss_paused else 'لا'}"
+        f"العملات التي تم فحصها: {len(signals)}\n"
+        f"إيقاف الدخول بسبب حد الخسارة: {'نعم' if loss_paused else 'لا'}\n"
+        "تنبيه: لا توجد أوامر تداول حقيقية."
     )
 
     save_state(state)
+
     logging.info("%s", summary.replace("\n", " | "))
 
-    if messages:
-        try:
+    try:
+        if messages:
             send_telegram("\n\n".join(messages + [summary]))
-        except Exception:
-            logging.exception(
-                "تعذّر إرسال إشعار الصفقة إلى تيليغرام."
-            )
-
-        for message in messages:
-            logging.info("%s", message)
+        else:
+            send_telegram(summary)
+    except Exception:
+        logging.exception("تعذر إرسال ملخص Telegram.")
 
 
 if __name__ == "__main__":
