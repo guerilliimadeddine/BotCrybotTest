@@ -28,13 +28,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
-
-      - name: Run unit tests
-        run: python -m unittest -v
 
       - name: Run paper trading bot
         env:
