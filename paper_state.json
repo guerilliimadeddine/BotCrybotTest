@@ -101,9 +101,11 @@
     "SXTUSDT": "1791810000000",
     "OGNUSDT": "1791810000000",
     "SKHYBUSDT": "1791810000000",
-    "SOXLBUSDT": "1791810000000"
+    "SOXLBUSDT": "1791810000000",
+    "SANDUSDT": "1791810000000"
   },
   "trades": [],
   "utc_day": "2026-10-12",
-  "day_start_equity": 100.0
+  "day_start_equity": 100.0,
+  "last_liquidity_alert": {}
 }
